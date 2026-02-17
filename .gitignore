@@ -1,0 +1,27 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Data
+data/raw/
+data/processed/
+*.db
+*.bsp
+*.tls
+*.tpc
+*.parquet
+
+# Models (optional, if large)
+# models/*.pkl
+# models/*.joblib
+
+# OS
+.DS_Store
+Thumbs.db
