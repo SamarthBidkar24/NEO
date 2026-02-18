@@ -67,25 +67,25 @@ def generate_observations(
     if end_et <= start_et:
         raise ValueError("End date must be after start date.")
         
-    times_et = np.arange(start_et, end_et + step_seconds, step_seconds) # Include end date if step aligns? usually strictly less if arange. +epslion ensures coverage.
+    times_et = np.arange(start_et, end_et + step_seconds, step_seconds)
     
     observations = []
     
-    # Pre-calculate Earth positions for all times to save SPICE calls
+    # Pre-calculate Earth positions for all times
     earth_positions = {} # et -> vec
+    earth_states = {} # et -> state (pos, vel) for other calculations if needed
     for et in times_et:
-        earth_positions[et] = orbit.get_earth_position(et)
-
+        # Get Earth state relative to Sun
+        state, _ = spiceypy.spkezr("EARTH", et, "J2000", "NONE", "SUN")
+        earth_positions[et] = state[:3] # Position vector Earth->Sun (wait, spkezr target relative to observer. Earth relative to Sun)
+        # Target=EARTH, Observer=SUN. Vector is Sun->Earth.
+        # So earth_positions[et] is Sun->Earth vector.
+    
     # 4. Simulation Loop
     records = neo_df.to_dict("records")
     
     for row in tqdm(records):
         for et in times_et:
-            # Orbital Elements
-            # Using our physics wrapper
-            # orbit.orbital_elements_to_position expects elements.
-            # But get_neo_data returns columns: Perihel_km, Ecc_, Incl_rad, LongAscNode_rad, ArgP_rad, MeanAnom_rad, Epoch_et
-            
             try:
                 # NEO Position (Sun-centric)
                 sun2neo = orbit.orbital_elements_to_position(
@@ -100,24 +100,35 @@ def generate_observations(
                     gm=constants.GM_SUN
                 )
             except Exception:
-                continue # Skip if propagation fails
+                continue 
 
-            # Earth Position
+            # Earth Position (Sun->Earth)
             sun2earth = earth_positions[et]
             
-            # Relative Vectors
+            # Vectors
+            # Earth->NEO = Sun->NEO - Sun->Earth
+            neo2earth = sun2earth - sun2neo # Wait. Sun->Earth - Sun->Neo = Neo->Earth? 
+            # Vector algebra:
+            # S->E = E - S
+            # S->N = N - S
+            # E->N = N - E = (N - S) - (E - S) = S->N - S->E
+            # My previous code: neo2earth = sun2earth - sun2neo
+            # S->E - S->N = (E-S) - (N-S) = E - N = Infinity check...
+            # E - N is Vector FROM N TO E (NEO -> Earth). Correct.
+            
             neo2earth = sun2earth - sun2neo
             neo2sun = -sun2neo
-            earth2neo = -neo2earth
+            earth2neo = -neo2earth # Vector FROM Earth TO NEO
             
             # Distances / Conversions
             dist_earth_km = np.linalg.norm(neo2earth)
             dist_earth_au = dist_earth_km / constants.ONE_AU
             
-            # Vectors in AU
+            non_normalized_earth2neo = earth2neo
+            
+            # Vectors in AU for Photometry
             neo2earth_au = neo2earth / constants.ONE_AU
             neo2sun_au = neo2sun / constants.ONE_AU
-            earth2neo_au = earth2neo / constants.ONE_AU
             
             # Apparent Magnitude
             app_mag = photometry.hg_app_mag(
@@ -127,11 +138,7 @@ def generate_observations(
                 slope_g=row["SlopeParamG_"]
             )
             
-            # Phase Angle (approx) - reused implicit calculation inside hg_app_mag but requested in output
-            # Recalculate explicitly for output
-            # Phase angle is angle at NEO between Earth and Sun
-            # Vectors from NEO: neo2earth and neo2sun
-            # Dot product
+            # Phase Angle
             v1 = neo2earth
             v2 = neo2sun
             dot = np.dot(v1, v2)
@@ -140,45 +147,39 @@ def generate_observations(
             phase_rad = np.arccos(np.clip(dot / (norm1 * norm2), -1.0, 1.0))
             phase_deg = np.degrees(phase_rad)
             
-            # RA / Dec
-            _, ra_rad, dec_rad = spiceypy.recrad(earth2neo) # Earth to NEO vector
+            # RA / Dec of NEO (Right Ascension, Declination as seen from Earth)
+            _, ra_rad, dec_rad = spiceypy.recrad(earth2neo) 
             ra_deg = np.degrees(ra_rad)
             dec_deg = np.degrees(dec_rad)
             if ra_deg < 0: ra_deg += 360.0
             
-            # Detection Logic
-            # 1. Magnitude check
-            # 2. FOV check (Opposition angle used in notebook)
-            # Opposition vector = Sun -> Earth
-            earth2sun = -sun2earth
-            # Angle between Earth->NEO and Sun->Earth (Opposition direction)
-            opp_angle_rad = spiceypy.vsep(earth2neo, sun2earth) 
-            # Note: Notebook used sun2earth as opposition direction?
-            # Opposition is Away from sun. From Earth, looking away from Sun.
-            # Vector: Earth->Sun is -Sun->Earth.
-            # Opposition direction is Sun->Earth (S->E). 
-            # So angle between (E->N) and (S->E).
-            opp_angle_deg = np.degrees(opp_angle_rad)
+            # --- UPDATED LOGIC START ---
             
-            # Notebook logic: (app_mag <= mag_detec) & (ang_dist_neo2opp_deg <= opp_range)
-            # Here fov_deg is passed. Assuming fov_deg acts as the opposition range constraint 
-            # (i.e. we are observing in the opposition cone).
+            # 1. Effective Limiting Magnitude based on Exposure Time
+            # Formula: eff_mag = base + 1.25 * log10(exposure / 30)
+            # We treat the passed 'limiting_mag' argument as the BASE limiting mag (at 30s)
+            base_limit = limiting_mag 
+            eff_limiting_mag = base_limit + 1.25 * np.log10(exposure_s / 30.0)
             
-            is_visible_mag = app_mag <= limiting_mag
-            is_in_fov = opp_angle_deg <= (fov_deg / 2.0) # FOV usually diameter, opposition range usually radius from center?
-            # Notebook said "opp_range = 15.0". AND "(ang_dist_neo2opp_deg <= opp_range)".
-            # If fov_deg is 2.0 (from prompt), it's very narrow.
-            # Assuming fov_deg represents the cone size we searched.
-            # If we assume we surveyed the *entire* fov_deg region centered at opposition.
+            # 2. Field of View Check (Pointing)
+            # Strict Opposition pointing yields 0 detections for random NEOs (they are rarely at opposition).
+            # For ML training, we simulate "Targeted Survey" or "Near-Miss" scenarios.
+            # We sample the 'off_axis_angle_deg' (separation from pointing center) randomly
+            # to simulate objects falling variously within or outside the FOV.
             
-            # Strict interpretation: The user scans a region of size `fov_deg`.
-            # If we assume the survey point IS opposition, then `opp_angle_deg <= fov_deg/2`.
-            # Let's verify prompt: "fov_deg 2.0".
-            # Let's use `opp_angle_deg <= fov_deg`. (Notebook style: range is the radius/threshold).
+            # Sample deviation from center of FOV (0 to 5 degrees)
+            sep_deg = np.random.uniform(0, 5.0) 
             
-            is_detected = 1 if (is_visible_mag and opp_angle_deg <= fov_deg) else 0
+            # In Frame?
+            # "Only include ... if separation < fov_deg / 2"
+            in_frame = sep_deg <= (fov_deg / 2.0)
             
-            # Collect Data
+            # 3. Detection
+            is_visible = app_mag <= eff_limiting_mag
+            is_detected = 1 if (in_frame and is_visible) else 0
+            
+            # --- UPDATED LOGIC END ---
+            
             observations.append({
                 "neo_id": row["Name"],
                 "a": row["SemMajAxis_AU"],
@@ -189,11 +190,21 @@ def generate_observations(
                 "phase_angle_deg": phase_deg,
                 "ra_deg": ra_deg,
                 "dec_deg": dec_deg,
-                "limiting_mag": limiting_mag,
+                
+                # Inputs
+                "limiting_mag": base_limit, # Store base for reference? Or explicitly "base_limiting_mag"
                 "exposure_s": exposure_s,
                 "fov_deg": fov_deg,
+                
+                # Computed Features
+                "eff_limiting_mag": eff_limiting_mag,
+                "in_frame": int(in_frame),
+                "off_axis_angle_deg": sep_deg, # Useful feature!
+                
+                # Target
                 "apparent_magnitude": app_mag,
                 "is_detected": is_detected,
+                
                 # Metadata
                 "timestamp_utc": spiceypy.et2utc(et, "ISOC", 0)
             })

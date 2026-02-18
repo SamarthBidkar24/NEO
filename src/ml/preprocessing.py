@@ -20,7 +20,9 @@ FEATURE_COLUMNS = [
     "dec_deg", 
     "limiting_mag", 
     "exposure_s", 
-    "fov_deg"
+    "fov_deg",
+    "eff_limiting_mag",
+    "in_frame"
 ]
 
 def load_xy(task: str, csv_path: str = "data/simulated_observations.csv"):

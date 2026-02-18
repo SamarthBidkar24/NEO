@@ -9,5 +9,7 @@
     "dec_deg",
     "limiting_mag",
     "exposure_s",
-    "fov_deg"
+    "fov_deg",
+    "eff_limiting_mag",
+    "in_frame"
 ]
