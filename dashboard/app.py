@@ -10,6 +10,9 @@ import numpy as np
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import datetime
+from src.simulation.generator import generate_observations
+
 # Define features directly to avoid import issues
 FEATURE_COLUMNS = [
     "a", "e", "i", "H", 
@@ -39,6 +42,44 @@ def load_data():
         df["date"] = df["timestamp_utc"].dt.date
     return df
 
+@st.cache_data
+def simulate_date_observations(target_date):
+    """Dynamically simulate NEO observations for dates not in the pre-computed dataset."""
+    start_str = target_date.strftime("%Y-%m-%d")
+    next_day = target_date + datetime.timedelta(days=1)
+    end_str = next_day.strftime("%Y-%m-%d")
+    scenarios = [
+        (30.0, 1.0),
+        (30.0, 5.0),
+        (60.0, 2.0),
+        (120.0, 2.0),
+        (300.0, 1.0),
+        (300.0, 5.0),
+        (300.0, 10.0),
+        (10.0, 2.0),
+    ]
+    sim_dfs = []
+    for sc_exp, sc_fov in scenarios:
+        try:
+            sdf = generate_observations(
+                num_neos=200,
+                start_date=start_str,
+                end_date=end_str,
+                step_hours=24,
+                limiting_mag=22.0,
+                exposure_s=sc_exp,
+                fov_deg=sc_fov
+            )
+            sim_dfs.append(sdf)
+        except Exception:
+            pass
+    if sim_dfs:
+        combined = pd.concat(sim_dfs, ignore_index=True)
+        combined["timestamp_utc"] = pd.to_datetime(combined["timestamp_utc"])
+        combined["date"] = combined["timestamp_utc"].dt.date
+        return combined[combined["date"] == target_date].copy()
+    return pd.DataFrame()
+
 def load_models():
     try:
         reg = joblib.load(MODELS_DIR / "regressor.joblib")
@@ -58,8 +99,20 @@ def main():
 
     # Sidebar
     st.sidebar.header("1. Select Observation Date")
-    unique_dates = sorted(df["date"].unique())
-    selected_date = st.sidebar.selectbox("Date", unique_dates)
+    unique_dates = sorted(df["date"].dropna().unique())
+    today = datetime.date.today()
+    latest_date = unique_dates[-1] if len(unique_dates) > 0 else today
+    # Default to the most recent date available in the dataset
+    default_date = latest_date
+
+    selected_date = st.sidebar.date_input(
+        "Observation Date",
+        value=default_date,
+        min_value=datetime.date(2020, 1, 1),
+        max_value=None,
+        help="Select any observation date. Pre-computed or simulated on demand."
+    )
+    st.sidebar.caption(f"📅 Pre-computed dataset: **{unique_dates[0]}** to **{unique_dates[-1]}**. Any recent date will simulate dynamically.")
 
     st.sidebar.header("2. Camera Settings (Simulation)")
     base_limiting_mag = st.sidebar.slider("Base Limiting Magnitude (at 30s)", 15.0, 25.0, 22.0, 0.1)
@@ -71,8 +124,18 @@ def main():
     st.sidebar.caption(f"Effective Limiting Mag: **{limiting_mag:.2f}**")
     fov_deg = st.sidebar.slider("Field of View (deg)", 0.5, 10.0, 2.0, 0.1)
     
-    # Filter Data based on Regimes (Coarse Filtering)
-    df_filtered = df[df["date"] == selected_date].copy()
+    # Filter Data based on selected date
+    if selected_date in set(unique_dates):
+        df_filtered = df[df["date"] == selected_date].copy()
+    else:
+        with st.spinner(f"Simulating NEO observations for {selected_date}..."):
+            df_filtered = simulate_date_observations(selected_date)
+            if df_filtered.empty:
+                closest_date = min(unique_dates, key=lambda d: abs((d - selected_date).days))
+                st.sidebar.warning(f"Could not simulate for {selected_date}. Showing closest date: {closest_date}")
+                df_filtered = df[df["date"] == closest_date].copy()
+            else:
+                st.sidebar.success(f"Simulated {len(df_filtered)} observations for {selected_date}")
 
     # 1. Limiting Magnitude -> Difficulty Regime
     # Bright (<=18), Medium (18-21), Faint (>21)
